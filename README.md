@@ -16,6 +16,10 @@ FastAPI + PostgreSQL，两个共库 API 进程协作，执行者崩溃后另一�
 - 同一 `event_id` 且同一 `known_time` 出现 **不同值** → 整个导入批次拒绝，不写入任何行；完全相同的重复行幂等忽略。
 - 撤回事件不得携带收入；非撤回事件必须携带整数收入（Pydantic 校验）。
 - 每个导入批次在 `import_batches` 留痕（accepted/rejected + 原因）。
+- **逐行源行留存**：每条征信上传记录可携带 `source_line`（上传文件行号，缺省取在
+  请求体中的 1-based 序号）；批次受理时把 **每一条源行的原字段与行号** 写入
+  `credit_import_rows`，与版本写入、批次留痕处于 **同一事务**——进程崩溃或并发冲突时
+  要么整批提交、要么整批回滚，绝不暴露半份回执。
 
 ### 每笔申请的回填算法（单条 SQL 完成，见 `app/worker.py`）
 
@@ -82,6 +86,14 @@ curl -i -X POST localhost:8001/api/v1/imports/credit-events \
   -H 'Content-Type: application/json' -d @data/conflict_events.json
 ```
 
+### 2b. 逐行核账演示（详见第五节）
+
+```bash
+# 首次导入 -> 记下 ingest_batch_id；同值重传 imported=0 仍可逐行核对；
+# 异值重传 409；最后对成功批次调取核账报告
+python3 scripts/reconciliation_demo.py
+```
+
 ### 3. 生成批次并观察两进程协作
 
 ```bash
@@ -128,12 +140,82 @@ bash scripts/restart_demo.sh          # Docker 环境：重启非执行者 + SIG
 脚本会生成 60 笔数据的大批次，重启非执行者确认批次不受干扰，再 `docker compose kill`
 执行者，验证存活进程在租约过期后接管并完成，最后断言无遗漏、无重复、来源完整。
 
-## 五、脚本与测试
+## 五、逐行核账 API（征信导入回执核对）
+
+风控核对征信上传回执时，「新增 0 条」并不代表本次提交的源行都与库内版本一致。
+本服务在导入侧留存每条源行，并提供独立的 **只读核账** 接口，以库内实际版本为准逐行对照。
+
+### 核账接口
+
+```
+GET /api/v1/imports/credit-events/{ingest_batch_id}/reconciliation?limit=&cursor=
+GET /api/v1/imports/credit-events          # 列出征信导入批次，reconcilable 标注可否核账
+```
+
+对批次内 **每一条源行**，按自然版本键 `(event_id, known_time)` 与
+`credit_event_versions` 中的实际版本对照，返回：
+
+| 行状态 | 含义 |
+|---|---|
+| `MATCHED` | 键存在，且 `customer_id/business_time/income/withdrawn` 与源行完全一致；附 `first_ingest_batch_id`（该版本首次入库批次） |
+| `MISMATCHED` | 键存在但至少一个字段不符，`field_differences` 列出差异字段，`actual` 给出库内实际值 |
+| `MISSING` | 库内不存在该 `(event_id, known_time)` 版本 |
+
+整批结论（响应顶层，统计覆盖 **全部源行**，不受分页影响）：
+
+- `reconciliation_state`：`RECONCILED`（全行 MATCHED）/ `NOT_RECONCILED`（存在 MISMATCHED
+  或 MISSING）/ `UNRECONCILABLE`（旧批次无源行记录）。
+- `training_eligible`：仅当全部源行 MATCHED 时为 `true`。**即使回执显示成功，异值也判
+  不通过**；`MISSING/MISMATCHED` 任一存在即为 `false`，`reason` 给出人类可读原因。
+- 结果按 `source_line` keyset 分页（与回填结果同一套 cursor 机制）。
+
+### 关键规则
+
+1. **同键同值重传也全量核对**：幂等重传 `imported=0`（未新增版本）时，源行依旧逐条写入
+   新批次，核账覆盖全部源行；`first_ingest_batch_id` 仍指向版本首次入库的那个批次。
+2. **异值绝不判通过**：同键异值的导入在受理时即整批 409（含并发场景，见下）；即便库内
+   版本在导入后被外部改写/删除，核账以当前库内实际值为准，判 `MISMATCHED/MISSING`。
+3. **并发导入不暴露半份回执**：已存在版本的交叉校验加 `FOR UPDATE` 行锁；对新键，插入后
+   在同一事务内回读比对——若并发事务已提交异值，则回滚保存点并整批拒绝。版本写入、批次
+   留痕、源行写入同生共死（单事务），上传中断/进程崩溃不会留下任何半截数据。
+4. **旧批次无法核账时明确表态**：启用源行留存之前产生的批次在 `credit_import_rows` 中没有
+   记录，核账返回 `UNRECONCILABLE` + `training_eligible=false`，绝不默认通过。
+5. 被拒绝（rejected）的批次没有源行，对其核账返回 409 并说明原因。
+
+### /docs 核账演示
+
+```bash
+# 首次导入（3 条，带显式 source_line: 10/20/30）
+curl -s -X POST localhost:8001/api/v1/imports/credit-events \
+  -H 'Content-Type: application/json' -d @data/recon_events.json
+# 同键同值重传：imported=0、source_rows=3
+curl -s -X POST localhost:8002/api/v1/imports/credit-events \
+  -H 'Content-Type: application/json' -d @data/recon_events_reupload_same.json
+# 同键异值重传：整批 409
+curl -i -X POST localhost:8001/api/v1/imports/credit-events \
+  -H 'Content-Type: application/json' -d @data/recon_events_reupload_diff.json
+# 用任一 accepted 批次号核账（分页参数同结果接口）
+curl "localhost:8001/api/v1/imports/credit-events/$BID/reconciliation?limit=2"
+```
+
+脚本化端到端演示（含库内篡改→MISMATCHED、删行→MISSING、旧批次 UNRECONCILABLE、
+并发异值竞争、原子性断言）：
+
+```bash
+# 仅 HTTP 的检查无需 DSN：
+python3 scripts/reconciliation_demo.py http://127.0.0.1:8001 http://127.0.0.1:8002
+# 完整检查（需要直连数据库做篡改/旧批次/并发验证）：
+python3 scripts/reconciliation_demo.py http://127.0.0.1:8001 http://127.0.0.1:8002 \
+    postgresql://postgres:postgres@127.0.0.1:55432/riskdb
+```
+
+## 六、脚本与测试
 
 | 脚本 | 作用 |
 |---|---|
 | `scripts/seed.py` | 导入 `data/` 下的虚构申请与事件 |
 | `scripts/demo.py` | 端到端演示（导入、拒绝、时点结果、迟到更正隔离、分页、409 闸门） |
+| `scripts/reconciliation_demo.py` | 逐行核账端到端演示（MATCHED/MISMATCHED/MISSING、重传 0 新增全量核对、旧批次不可核账、并发异值、原子性） |
 | `scripts/gen_bulk.py` | 经 API 生成大批量虚构数据 |
 | `scripts/restart_demo.sh` | Docker 下的重启/故障转移演示 |
 | `scripts/lease_failover_test.py` | 不依赖 Docker 的租约接管测试（以 SQL 令租约过期精确模拟 SIGKILL 后的状态） |
@@ -147,17 +229,20 @@ pip install -r requirements.txt
 DATABASE_URL=postgresql://... uvicorn app.main:app --port 8001 &
 DATABASE_URL=postgresql://... uvicorn app.main:app --port 8002 &
 python3 scripts/demo.py
+python3 scripts/reconciliation_demo.py
 DATABASE_URL=postgresql://... python3 scripts/test_pit_sql.py
 DATABASE_URL=postgresql://... python3 scripts/lease_failover_test.py \
     http://127.0.0.1:8001 http://127.0.0.1:8002 postgresql://... 40
 ```
 
-## 六、API 一览
+## 七、API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/v1/imports/applications` | 整批事务导入申请，重复 ID 全拒绝 |
-| POST | `/api/v1/imports/credit-events` | 整批事务导入事件版本，同键异值全拒绝 |
+| POST | `/api/v1/imports/credit-events` | 整批事务导入事件版本，同键异值全拒绝；逐行留存源字段与行号 |
+| GET | `/api/v1/imports/credit-events` | 列出征信导入批次及 `reconcilable` 标记 |
+| GET | `/api/v1/imports/credit-events/{id}/reconciliation` | 按批次逐行核账：源行 vs 库内实际版本 + 首次入库批次 + 训练结论（分页） |
 | POST | `/api/v1/batches` | 生成回填批次（固化受理时输入） |
 | GET | `/api/v1/batches` / `/api/v1/batches/{id}` | 批次状态 |
 | POST | `/api/v1/batches/{id}/resume` | FAILED 批次断点续算 |

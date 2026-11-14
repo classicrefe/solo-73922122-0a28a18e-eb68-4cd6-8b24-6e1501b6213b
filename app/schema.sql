@@ -30,6 +30,27 @@ CREATE TABLE IF NOT EXISTS credit_event_versions (
 CREATE INDEX IF NOT EXISTS idx_cev_customer_lookup
     ON credit_event_versions (customer_id, business_time, event_id, known_time);
 
+-- Per-line source audit of each ACCEPTED credit-events import batch ----------
+-- One row per submitted source line (exact duplicates kept as separate lines).
+-- Written inside the import transaction, so an import either commits with all
+-- of its source rows or leaves nothing behind — a crashed/interrupted import
+-- can never expose a half receipt. Batches that predate this table have no
+-- rows here and are reported as unreconcilable (never silently "passed").
+CREATE TABLE IF NOT EXISTS credit_import_rows (
+    ingest_batch_id UUID NOT NULL,
+    source_line     INTEGER NOT NULL CHECK (source_line > 0),
+    event_id        TEXT NOT NULL,
+    customer_id     TEXT NOT NULL,
+    business_time   TIMESTAMPTZ NOT NULL,
+    known_time      TIMESTAMPTZ NOT NULL,
+    income          INTEGER,                -- NULL when withdrawn = true
+    withdrawn       BOOLEAN NOT NULL,
+    PRIMARY KEY (ingest_batch_id, source_line)
+);
+-- Reconciliation looks the stored version up by the natural version key.
+CREATE INDEX IF NOT EXISTS idx_cir_batch_lookup
+    ON credit_import_rows (ingest_batch_id, event_id, known_time);
+
 -- Audit of every import batch ------------------------------------------------
 CREATE TABLE IF NOT EXISTS import_batches (
     ingest_batch_id UUID PRIMARY KEY,
